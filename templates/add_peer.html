@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Add WireGuard Peer</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        body { padding-top: 50px; }
+        .container { max-width: 600px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <h1 class="mb-4">Add New WireGuard Peer</h1>
+
+        <form method="POST" action="{{ url_for('add_peer') }}">
+            <div class="form-group">
+                <label for="name">Peer Name:</label>
+                <input type="text" class="form-control" id="name" name="name" required>
+                <small class="form-text text-muted">A unique name for this WireGuard client (e.g., "john_laptop", "mobile_phone").</small>
+            </div>
+            <button type="submit" class="btn btn-primary">Add Peer</button>
+            <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancel</a>
+        </form>
+    </div>
+</body>
+</html>

@@ -1,0 +1,9 @@
+Flask
+Flask-SQLAlchemy
+Authlib
+wgconfig
+qrcode
+netaddr
+python-dotenv # Good for local dev, not strictly needed for systemd in prod
+psycopg2-binary # If you are using PostgreSQL as recommended
+gunicorn # For production WSGI server

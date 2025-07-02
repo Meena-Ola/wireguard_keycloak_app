@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WireGuard Dashboard</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        body { padding-top: 50px; }
+        .container { max-width: 1000px; }
+        .peer-box {
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <h1 class="mb-4">WireGuard Dashboard</h1>
+        <p>Hello, <strong>{{ user.username }}</strong>!
+            {% if is_admin %}<span class="badge badge-warning">Admin</span>{% endif %}
+        </p>
+
+        {% if is_admin %}
+            <a href="{{ url_for('add_peer') }}" class="btn btn-primary mb-3">Add New Peer</a>
+        {% endif %}
+
+        <h2 class="mt-4">Your Peers:</h2>
+        {% if peers %}
+            <div class="row">
+            {% for peer in peers %}
+                <div class="col-md-6">
+                    <div class="peer-box {% if not peer.is_active %}bg-light text-muted{% endif %}">
+                        <h5>{{ peer.name }} {% if not peer.is_active %}<span class="badge badge-danger">Inactive</span>{% endif %}</h5>
+                        <p><strong>IP:</strong> {{ peer.assigned_ip }}</p>
+                        <p><strong>Public Key:</strong> <code>{{ peer.public_key }}</code></p>
+                        <p><strong>Created:</strong> {{ peer.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+                        {% if peer.is_active %}
+                            <a href="{{ url_for('download_config', peer_id=peer.id) }}" class="btn btn-sm btn-info">Download Config</a>
+                            <a href="{{ url_for('qrcode_image', peer_id=peer.id) }}" class="btn btn-sm btn-secondary" target="_blank">Show QR Code</a>
+                            {% if is_admin %}
+                                <form action="{{ url_for('revoke_peer', peer_id=peer.id) }}" method="post" style="display:inline;">
+                                    <button type="submit" class="btn btn-sm btn-warning" onclick="return confirm('Are you sure you want to revoke {{ peer.name }}?');">Revoke</button>
+                                </form>
+                            {% endif %}
+                        {% else %}
+                            <span class="text-danger">This peer is inactive.</span>
+                        {% endif %}
+                    </div>
+                </div>
+            {% endfor %}
+            </div>
+        {% else %}
+            <p>No WireGuard peers found for you yet. {% if is_admin %}Go ahead and <a href="{{ url_for('add_peer') }}">add one</a>!{% endif %}</p>
+        {% endif %}
+
+        <hr>
+        <p><a href="{{ url_for('index') }}" class="btn btn-link">Back to Home</a> | <a href="{{ url_for('logout') }}" class="btn btn-danger">Logout</a></p>
+    </div>
+</body>
+</html>
