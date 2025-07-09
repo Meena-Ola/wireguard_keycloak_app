@@ -1,297 +1,361 @@
+# --- ADD THESE TWO LINES AT THE VERY TOP ---
+from dotenv import load_dotenv
+load_dotenv() # This loads the environment variables from .env
+# --- END ADDITION ---
+
 from flask import Flask, render_template, redirect, url_for, session, request, flash, send_file
 from authlib.integrations.flask_client import OAuth
-from flask_sqlalchemy import SQLAlchemy
-from flask_migrate import Migrate
-from config import Config
-from models import db, WireGuardPeer, User
-from wireguard_utils import generate_wireguard_keys, get_next_available_ip, generate_client_config, update_wireguard_server_config_temp, generate_qr_code
+from authlib.integrations.base_client.errors import OAuthError
+import time
 import os
 import subprocess
 from functools import wraps
-from netaddr import IPNetwork
 import logging
 from logging.handlers import RotatingFileHandler
 from io import BytesIO
-from sqlalchemy import func as sa
-from authlib.common.security import generate_token
+import base64
+from datetime import datetime
 
-# Helper function to get the current logged-in user
-def get_current_user():
-    user_id = session.get('user_id')
-    print(f"DEBUG: get_current_user - user_id from session: {user_id}")
-    if user_id:
-        user = User.query.get(user_id)
-        print(f"DEBUG: get_current_user - fetched user: {user.username if user else 'None'}")
-        return user # Assumes User model is defined
-    print("DEBUG: get_current_user - No user_id in session.")
-    return None
+# --- SQLAlchemy and Flask-Migrate Imports ---
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+# --- END SQLAlchemy Imports ---
 
-# Helper function to check if the current user is an admin
-def is_admin(user=None):
-    if user is None:
-        user = get_current_user()
-    if user and 'admin' in user.roles: # Assuming 'admin' is a role string
-        return True
-    return False
+# --- Flask-Login Imports ---
+from flask_login import LoginManager, current_user, login_user, logout_user, login_required as flask_login_required
+# --- END Flask-Login Imports ---
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
-logger = logging.getLogger(__name__) # This line defines the 'logger' variable
+# --- Import your models ---
+from models import db, User, WireGuardPeer
+# --- END Import models ---
 
-app = Flask(__name__)
-app.config.from_object(Config)
-db.init_app(app)
-oauth = OAuth(app)
-migrate = Migrate(app, db) # Initialize Flask-Migrate
-
-# Configure logging - This block needs to be after `app = Flask(__name__)`
-if not app.debug:
-    if not os.path.exists('logs'):
-        os.mkdir('logs')
-    
-    file_handler = RotatingFileHandler('logs/wireguard_app.log', maxBytes=10240, backupCount=10)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'))
-    file_handler.setLevel(logging.INFO)
-    app.logger.addHandler(file_handler)
-    app.logger.setLevel(logging.INFO)
-    app.logger.info('WireGuard App startup')
-
-# Example error handler
-@app.errorhandler(500)
-def internal_error(error):
-    app.logger.exception('An internal server error occurred')
-    db.session.rollback() # Ensure rollback on database errors
-    return "Internal Server Error", 500 # Render a custom error page in production
-
-# Register Keycloak OIDC client
-oauth.register(
-    'keycloak',
-    client_id=app.config['KEYCLOAK_CLIENT_ID'],
-    client_secret=app.config['KEYCLOAK_CLIENT_SECRET'], # Corrected typo: KEYCLOCK -> KEYCLOAK
-    server_metadata_url=f"{app.config['KEYCLOAK_SERVER_URL']}/.well-known/openid-configuration",
-    client_kwargs={'scope': app.config['KEYCLOAK_SCOPES']}
+# For WireGuard utility functions
+from wireguard_utils import (
+    generate_wireguard_keys,
+    get_next_available_ip,
+    generate_client_config,
+    generate_server_config_string,
+    generate_qr_code
 )
 
-# --- Decorators for Authorization ---
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not get_current_user(): # This is the critical check
-            flash("Please log in to access this page.", "warning")
-            return redirect(url_for('login')) # Redirect to login page
-        return f(*args, **kwargs)
-    return decorated_function
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
+logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+
+# --- Flask Configuration ---
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'a_very_secret_and_random_key_for_dev')
+app.config['SESSION_COOKIE_SECURE'] = False
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+# --- PostgreSQL Database Configuration ---
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
+    'DATABASE_URL',
+    'postgresql://postgres:mysecretpassword@localhost:5432/wireguard_db'
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# --- END Database Configuration ---
+
+# --- Keycloak Configuration ---
+app.config['KEYCLOAK_SERVER_URL'] = os.getenv('KEYCLOAK_SERVER_URL', "http://192.168.56.101:3000/realms/tcc")
+app.config['KEYCLOAK_CLIENT_ID'] = os.getenv('KEYCLOAK_CLIENT_ID', "wireguard-admin-app")
+app.config['KEYCLOAK_CLIENT_SECRET'] = os.getenv('KEYCLOAK_CLIENT_SECRET', "OPQArB2tjIgDmb5SBKE2DQwKWyTqCBu8")
+app.config['KEYCLOAK_SCOPES'] = os.getenv('KEYCLOAK_SCOPES', "openid profile email")
+app.config['KEYCLOAK_CLIENT_REDIRECT_URIS'] = [
+    "http://192.168.56.101:5000/oidc/callback",
+    "http://10.0.2.15:5000/oidc/callback",
+    "http://127.0.0.1:5000/oidc/callback"
+]
+
+# --- WireGuard Configuration ---
+app.config['WG_SERVER_PUBLIC_KEY'] = os.getenv('WG_SERVER_PUBLIC_KEY', 'dummy_server_public_key_replace_me')
+app.config['WG_SERVER_PRIVATE_KEY'] = os.getenv('WG_SERVER_PRIVATE_KEY', 'dummy_server_private_key_replace_me')
+app.config['WG_SERVER_ENDPOINT'] = os.getenv('WG_SERVER_ENDPOINT', '192.168.56.101:51820')
+app.config['WG_INTERNAL_NETWORK'] = os.getenv('WG_INTERNAL_NETWORK', '10.8.0.0/24')
+app.config['WG_DNS_SERVERS'] = os.getenv('WG_DNS_SERVERS', '8.8.8.8,8.8.4.4')
+app.config['WG_ALLOWED_IPS'] = os.getenv('WG_ALLOWED_IPS', '0.0.0.0/0')
+app.config['WG_CONFIG_PATH'] = os.getenv('WG_CONFIG_PATH', '/etc/wireguard/wg0.conf')
+app.config['WG_PUBLIC_INTERFACE'] = os.getenv('WG_PUBLIC_INTERFACE', 'enp0s3')
+app.config['WG_SERVER_LISTEN_PORT'] = os.getenv('WG_SERVER_LISTEN_PORT', 51820)
+app.config['WG_SERVER_ADDRESS_CIDR'] = os.getenv('WG_SERVER_ADDRESS_CIDR', '10.8.0.1/24')
+
+# --- Database Initialization ---
+db.init_app(app)
+migrate = Migrate(app, db)
+# --- END Database Initialization ---
+
+# --- Flask-Login Initialization ---
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login' # Route name for login page
+# --- END Flask-Login Initialization ---
+
+# --- Flask-Login user_loader callback ---
+@login_manager.user_loader
+def load_user(user_id):
+    """
+    Required by Flask-Login.
+    Given a user ID, return the user object.
+    """
+    logger.debug(f"Flask-Login: Loading user with ID: {user_id}")
+    return User.query.get(user_id)
+# --- END Flask-Login user_loader ---
+
+# --- OIDC Client Initialization (using Authlib library) ---
+oauth = OAuth(app)
+try:
+    keycloak_oauth = oauth.register(
+        name='keycloak',
+        client_id=app.config['KEYCLOAK_CLIENT_ID'],
+        client_secret=app.config['KEYCLOAK_CLIENT_SECRET'],
+        server_metadata_url=f"{app.config['KEYCLOAK_SERVER_URL']}/.well-known/openid-configuration",
+        client_kwargs={
+            'scope': app.config['KEYCLOAK_SCOPES'],
+            'redirect_uris': app.config['KEYCLOAK_CLIENT_REDIRECT_URIS']
+        }
+    )
+    logger.info("Authlib Keycloak client registered successfully.")
+except Exception as e:
+    logger.error(f"Error during Authlib Keycloak client registration: {e}", exc_info=True)
+
+# Helper function for admin check (now uses current_user directly)
+def is_admin_check():
+    if current_user.is_authenticated and hasattr(current_user, 'get_roles'):
+        return 'admin' in current_user.get_roles()
+    return False
+
+# --- Context Processor to make current_user and is_admin_status available in all templates ---
+@app.context_processor
+def inject_user_and_roles():
+    # current_user is provided by Flask-Login
+    return dict(current_user=current_user, is_admin_status=is_admin_check())
+
+# --- Custom Decorators (now using Flask-Login's login_required) ---
+# Rename your custom login_required to avoid conflict with flask_login_required
+# We will use flask_login_required instead.
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not get_current_user() or not is_admin():
+        if not current_user.is_authenticated or not is_admin_check():
             flash("Admin access required.", "danger")
             return redirect(url_for('dashboard'))
         return f(*args, **kwargs)
     return decorated_function
 
-# --- Routes ---
 @app.route('/')
 def index():
-    if 'user_id' in session:
+    if current_user.is_authenticated: # Use Flask-Login's current_user
         return redirect(url_for('dashboard'))
     return render_template('index.html')
 
 @app.route('/login')
 def login():
-    redirect_uri = url_for('authorize', _external=True)
-    session['nonce'] = generate_token()
-    print(f"DEBUG: Flask generated redirect_uri: {redirect_uri}") # ADD THIS LINE
-    logger.info(f"Redirecting for login to: {redirect_uri}") # Or this for logging
-    return oauth.keycloak.authorize_redirect(redirect_uri, nonce=session['nonce'])
+    redirect_uri = url_for('oidc_callback', _external=True)
+    logger.info(f"Initiating login redirect to Keycloak. Redirect URI: {redirect_uri}")
+    return keycloak_oauth.authorize_redirect(redirect_uri)
 
 @app.route('/oidc/callback')
-def authorize():
+def oidc_callback():
     try:
-        nonce = session.pop('nonce', None)
-        token = oauth.keycloak.authorize_access_token(nonce=nonce)
-        print(f"DEBUG: Full token received: {token}")
-        userinfo = token.get('userinfo')
-        print(f"DEBUG: Userinfo from token: {userinfo}")
+        token_response = keycloak_oauth.authorize_access_token()
+        logger.debug(f"Authlib token response: {token_response}")
+
+        userinfo = token_response.get('userinfo')
+        if not userinfo:
+            userinfo = keycloak_oauth.fetch_userinfo()
+            logger.debug(f"Userinfo from fetch_userinfo: {userinfo}")
 
         if not userinfo:
-            flash('Failed to get user info from Keycloak.', 'danger')
+            logger.error("OIDC Callback Error: Could not retrieve user information (userinfo is None).")
+            flash("Login failed: User information missing. Please try again.", "danger")
             return redirect(url_for('index'))
 
-        user_id = userinfo['sub']
+        logger.debug(f"Raw Userinfo: {userinfo}")
+
+        user_roles_from_keycloak = []
+
+        # 1. Check for 'realm_access' roles (common for realm roles)
+        if 'realm_access' in userinfo and 'roles' in userinfo['realm_access']:
+            user_roles_from_keycloak.extend(userinfo['realm_access']['roles'])
+            logger.debug(f"Roles found in realm_access: {userinfo['realm_access']['roles']}")
+
+        # 2. Check for 'resource_access' roles (common for client roles)
+        client_id = app.config['KEYCLOAK_CLIENT_ID'] # "wireguard-admin-app"
+        if 'resource_access' in userinfo and client_id in userinfo['resource_access'] and 'roles' in userinfo['resource_access'][client_id]:
+            user_roles_from_keycloak.extend(userinfo['resource_access'][client_id]['roles'])
+            logger.debug(f"Roles found in resource_access for client '{client_id}': {userinfo['resource_access'][client_id]['roles']}")
+
+        # 3. Check for top-level 'roles' (as seen in your log is the actual source)
+        if 'roles' in userinfo and isinstance(userinfo['roles'], list):
+            user_roles_from_keycloak.extend(userinfo['roles'])
+            logger.debug(f"Roles found at top-level 'roles' key: {userinfo['roles']}")
+
+        # Ensure unique roles
+        user_roles_from_keycloak = list(set(user_roles_from_keycloak))
+        logger.debug(f"Final combined roles for user (before saving to DB): {user_roles_from_keycloak}")
+
+        user_id = userinfo.get('sub')
         username = userinfo.get('preferred_username', userinfo.get('name', user_id))
         email = userinfo.get('email')
-        # Keycloak roles are often in 'realm_access.roles' or 'resource_access.<client_id>.roles'
-        # Adjust based on how your Keycloak realm roles are mapped to tokens.
-        # Assuming realm_access for now:
-        user_roles = userinfo.get('realm_access', {}).get('roles', [])
-        # If you have specific client roles, you might need:
-        # client_roles = userinfo.get('resource_access', {}).get(app.config['KEYCLOAK_CLIENT_ID'], {}).get('roles', [])
-        # combined_roles = list(set(realm_roles + client_roles))
-
-        # For simplicity, let's use realm_roles for now:
 
         user = User.query.filter_by(id=user_id).first()
-
         if user:
-            # Update existing user details if necessary
             user.username = username
             user.email = email
-            user.roles = user_roles # Update roles
-            db.session.commit() # <<< Commit updates to existing user
-            logger.info(f"Existing user {user.username} ({user.id}) updated and logged in.")
+            user.set_roles(user_roles_from_keycloak) # This will now receive the correct roles
+            user.last_login_at = datetime.utcnow()
+            db.session.commit()
+            logger.info(f"Existing user {user.username} ({user.id}) updated with roles {user.get_roles()} and logged in.")
         else:
-            # Create a new user if they don't exist
-            new_user = User(
-                id=user_id,
-                username=username,
-                email=email,
-                roles=user_roles
-            )
+            new_user = User(id=user_id, username=username, email=email)
+            new_user.set_roles(user_roles_from_keycloak) # This will now receive the correct roles
             db.session.add(new_user)
-            db.session.commit() # <<< Commit new user creation
-            user = new_user # Set 'user' to the newly created user
-            logger.info(f"New user {user.username} ({user.id}) created and logged in.")
+            db.session.commit()
+            user = new_user
+            logger.info(f"New user {user.username} ({user.id}) created with roles {user.get_roles()} and logged in.")
 
-        # If user object is still None here, it means something went wrong in creation/retrieval
         if not user:
+            logger.error("OIDC Callback Error: User object is None after get/create operation.")
             flash("Login failed: Could not create or retrieve user record.", "danger")
             return redirect(url_for('index'))
-        
-        session['user_id'] = user.id
-        session['username'] = user.username
-        session['roles'] = user.roles # Store roles in session
 
-        # Removed the redundant flash and logger.info here, moved them inside if/else blocks
-        print(f"DEBUG: Session user_id after login: {session.get('user_id')}")
-        print(f"DEBUG: Session username after login: {session.get('username')}")
+        login_user(user) # This sets the user in the session for Flask-Login
+
+        session['access_token'] = token_response.get('access_token')
+        if 'expires_in' in token_response:
+            session['expires_at'] = time.time() + token_response['expires_in']
+        else:
+            logger.warning("Access token 'expires_in' not found in Authlib response.")
+            session['expires_at'] = time.time() + 3600
+        if 'refresh_token' in token_response:
+            session['refresh_token'] = token_response['refresh_token']
+        if 'id_token' in token_response:
+            session['id_token'] = token_response['id_token']
+        logger.debug(f"Flask-Login current_user ID after login: {current_user.get_id()}")
 
         flash(f'Logged in as {user.username}', 'success')
         return redirect(url_for('dashboard'))
 
+    except OAuthError as e:
+        logger.error(f"Authlib OIDC Callback Error: {e.description}", exc_info=True)
+        flash(f"Login failed: {e.description}. Please try again.", "danger")
+        return redirect(url_for('index'))
     except Exception as e:
-        db.session.rollback() # Ensure rollback on any error
-        logger.error(f"Keycloak authorization failed: {e}", exc_info=True)
-        flash('Login failed. Please try again.', 'danger')
-        session.pop('nonce', None)
+        db.session.rollback()
+        logger.error(f"An unexpected error occurred during authorization: {e}", exc_info=True)
+        flash('Login failed. An unexpected error occurred. Please try again.', 'danger')
         return redirect(url_for('index'))
 
 @app.route('/logout')
+@flask_login_required # Use Flask-Login's decorator
 def logout():
-    session.pop('user_id', None)
-    session.pop('username', None)
-    session.pop('roles', None)
-    session.pop('access_token', None)
+    id_token = session.get('id_token')
+    logout_user() # This clears the user from the Flask-Login session
+    session.clear() # Clear all other session data as well
     flash("You have been logged out.", "info")
-    # Keycloak logout (optional, but good for SSO)
-    # You might need to construct the Keycloak end_session_endpoint URL
-    # with post_logout_redirect_uri.
-    # See Keycloak documentation for proper OIDC logout.
-    # E.g., return redirect(f"{app.config['KEYCLOAK_SERVER_URL']}/protocol/openid-connect/logout?post_logout_redirect_uri={url_for('index', _external=True)}")
-    return redirect(url_for('index'))
+    # Redirect to Keycloak's logout endpoint for full OIDC session termination
+    keycloak_logout_url = f"{app.config['KEYCLOAK_SERVER_URL']}/protocol/openid-connect/logout?"
+    keycloak_logout_url += f"post_logout_redirect_uri={url_for('index', _external=True)}"
+    if id_token:
+        keycloak_logout_url += f"&id_token_hint={id_token}"
+    else:
+        app.logger.warning("No id_token found in session for Keycloak logout.")
+    return redirect(keycloak_logout_url)
 
 @app.route('/dashboard')
-@login_required
+@flask_login_required # Use Flask-Login's decorator
 def dashboard():
-    user = get_current_user()
-    print(f"DEBUG: User object in dashboard: {user}")
-    
-    if not user:
-        # This block might still be needed if get_current_user fails after session has user_id
-        flash('Please log in to view the dashboard.', 'warning')
-        return redirect(url_for('index'))
-    
-    peer = WireGuardPeer.query.filter_by(keycloak_user_id=user.id).first()
-    qr_code_b64 = None
-    client_config = None
-    
-    if peer:
-        if 'temp_private_key' in session:
-            client_private_key = session.pop('temp_private_key')
-            assigned_ip = session.pop('temp_peer_ip')
-            
-            client_config = generate_client_config(
-                app.config['WG_SERVER_PUBLIC_KEY'],
-                app.config['WG_SERVER_ENDPOINT'],
-                client_private_key,
-                assigned_ip,
-                app.config['WG_DNS_SERVERS'],
-                app.config['WG_ALLOWED_IPS']
-            )
-            qr_code_b64 = generate_qr_code(client_config)
+    user = current_user # Use Flask-Login's current_user directly
+    all_user_peers = []
 
-    # Pass the user object to the template here!
-    return render_template('dashboard.html', user=user, peer=peer, qr_code_b64=qr_code_b64, client_config=client_config)
+    generated_private_key = None
+    generated_public_key = None
+    generated_assigned_ip = None
+    generated_client_config = None
+    generated_qr_code_b64 = None
+
+    if user:
+        all_user_peers = user.wireguard_peers_collection
+
+        if 'temp_private_key' in session:
+            generated_private_key = session.pop('temp_private_key')
+            generated_public_key = session.pop('temp_public_key', None)
+            generated_assigned_ip = session.pop('temp_peer_ip', None)
+
+            if generated_private_key and generated_assigned_ip:
+                generated_client_config = generate_client_config(
+                    app.config['WG_SERVER_PUBLIC_KEY'],
+                    app.config['WG_SERVER_ENDPOINT'],
+                    generated_private_key,
+                    generated_assigned_ip,
+                    app.config['WG_DNS_SERVERS'],
+                    app.config['WG_ALLOWED_IPS']
+                )
+                generated_qr_code_b64 = generate_qr_code(generated_client_config)
+                flash("Your new/regenerated WireGuard configuration is displayed below. Please save it immediately!", "success")
+            else:
+                flash("Error retrieving temporary key/IP for config display.", "danger")
+
+        if not all_user_peers and not generated_private_key:
+            flash("No WireGuard peers configured for your account. Click 'Create New Peer' to get started.", "info")
+
+    return render_template(
+        'dashboard.html',
+        user=user,
+        all_user_peers=all_user_peers,
+        generated_private_key=generated_private_key,
+        generated_public_key=generated_public_key,
+        generated_assigned_ip=generated_assigned_ip,
+        generated_client_config=generated_client_config,
+        generated_qr_code_b64=generated_qr_code_b64,
+    )
 
 @app.route('/create_peer', methods=['POST'])
-@login_required
+@flask_login_required
 def create_peer():
-    user_id = session.get('user_id') # Use .get() for safety
-    username = session.get('username') # Use .get() for safety
-    existing_peer = WireGuardPeer.query.filter_by(keycloak_user_id=user_id).first()
-    
-    if existing_peer:
-        flash("You already have a WireGuard peer configured.", "warning")
+    user = current_user
+    if not user: # This check is technically redundant due to @flask_login_required but harmless
+        flash("User not logged in.", "danger")
+        return redirect(url_for('login'))
+
+    existing_peer_for_user = WireGuardPeer.query.filter_by(keycloak_user_id=user.id).first()
+    if existing_peer_for_user:
+        flash("You already have a WireGuard peer configured. Please regenerate if you need a new config.", "warning")
         return redirect(url_for('dashboard'))
-    
+
     try:
-        # Generate keys
         private_key, public_key = generate_wireguard_keys()
 
-        # Get existing IPs to avoid conflicts
-        existing_ips = [p.assigned_ip for p in WireGuardPeer.query.filter_by(enabled=True).all()]
-        assigned_ip = get_next_available_ip(app.config['WG_INTERNAL_NETWORK'], existing_ips)
+        all_enabled_peers = WireGuardPeer.query.filter(WireGuardPeer.enabled == True).all()
+        existing_ips = [p.assigned_ip for p in all_enabled_peers if p.assigned_ip]
 
-        # Create new peer in DB
+        assigned_ip = get_next_available_ip(app.config['WG_INTERNAL_NETWORK'], existing_ips)
+        if not assigned_ip:
+            raise ValueError("Could not assign an IP address. Network might be full.")
+
         new_peer = WireGuardPeer(
-            keycloak_user_id=user_id,
-            keycloak_username=username,
+            user_id=user.id,
+            keycloak_user_id=user.id,
+            keycloak_username=user.username,
             public_key=public_key,
-            # private_key is NOT stored in DB now based on security recommendations
             assigned_ip=assigned_ip,
-            enabled=True
+            enabled=True,
+            created_at=datetime.utcnow(),
+            allowed_ips=app.config['WG_ALLOWED_IPS']
         )
         db.session.add(new_peer)
         db.session.commit()
 
-        # Store the private_key temporarily in session to pass to dashboard
-        # This is for IMMEDIATE display/download. DO NOT PERSIST.
         session['temp_private_key'] = private_key
-        session['temp_peer_ip'] = assigned_ip # Also store IP for config generation
+        session['temp_peer_ip'] = assigned_ip
+        session['temp_public_key'] = public_key
 
-        # Update WireGuard server config immediately
-        all_enabled_peers = WireGuardPeer.query.filter_by(enabled=True).all()
-        peer_data_for_wg = [{
-            'public_key': p.public_key,
-            'assigned_ip': p.assigned_ip,
-            'keycloak_username': p.keycloak_username,
-            'enabled': p.enabled
-        } for p in all_enabled_peers]
+        update_current_wg_config()
 
-        update_wireguard_server_config_temp(
-            peer_data_for_wg,
-            app.config['WG_CONFIG_PATH'],
-            os.getenv('WG_SERVER_PRIVATE_KEY'), # Retrieve securely!
-            app.config['WG_INTERNAL_NETWORK'].split('/')[0] + '.1', # Server IP
-            51820, # ListenPort
-            os.getenv('WG_PUBLIC_INTERFACE', 'eth0') # Public interface
-        )
-
-        # Trigger the sync script on the server for the updated config
-        try:
-            subprocess.run(f"sudo /usr/local/bin/sync_wireguard.sh", check=True, shell=True)
-            app.logger.info("WireGuard config update triggered successfully.")
-        
-        except subprocess.CalledProcessError as e:
-            app.logger.error(f"Error triggering WireGuard sync: {e}", exc_info=True)
-            flash(f"Error: Could not apply WireGuard configuration on server. Please contact support.", "danger")
-            # Optionally revert DB change if sync fails critically
-            db.session.rollback() # Consider if this is appropriate for your error handling
-            return redirect(url_for('dashboard'))
-
-        flash("WireGuard peer created successfully! Please download your configuration now.", "success")
-        return redirect(url_for('dashboard')) # Redirect to dashboard to show config
+        flash("WireGuard peer created successfully! Configuration shown below.", "success")
+        return redirect(url_for('dashboard'))
 
     except Exception as e:
         db.session.rollback()
@@ -299,169 +363,273 @@ def create_peer():
         flash(f"Error creating peer: {e}", "danger")
         return redirect(url_for('dashboard'))
 
-@app.route('/delete_peer', methods=['POST'])
-@login_required
-def delete_peer():
-    user_id = session['user']['id']
-    peer = WireGuardPeer.query.filter_by(keycloak_user_id=user_id).first()
+@app.route('/regenerate_peer/<int:peer_id>', methods=['POST'])
+@flask_login_required
+def regenerate_peer(peer_id):
+    user = current_user
+    if not user:
+        flash("User not logged in.", "danger")
+        return redirect(url_for('login'))
 
+    peer = WireGuardPeer.query.filter_by(id=peer_id, user_id=user.id).first()
     if not peer:
-        flash("No WireGuard peer found for your account.", "warning")
+        flash("Peer not found or you do not have permission to modify it.", "danger")
         return redirect(url_for('dashboard'))
 
     try:
-        db.session.delete(peer)
+        private_key, public_key = generate_wireguard_keys()
+
+        all_enabled_peers_except_current = WireGuardPeer.query.filter(
+            WireGuardPeer.enabled == True, WireGuardPeer.id != peer_id
+        ).all()
+        existing_ips = [p.assigned_ip for p in all_enabled_peers_except_current if p.assigned_ip]
+
+        assigned_ip = get_next_available_ip(app.config['WG_INTERNAL_NETWORK'], existing_ips)
+        if not assigned_ip:
+            raise ValueError("Could not assign a new IP address. Network might be full.")
+
+        peer.public_key = public_key
+        peer.assigned_ip = assigned_ip
+        peer.last_connected_at = None
         db.session.commit()
 
-        # Update WireGuard server config to remove the peer
-        all_enabled_peers = WireGuardPeer.query.filter_by(enabled=True).all()
+        session['temp_private_key'] = private_key
+        session['temp_public_key'] = public_key
+        session['temp_peer_ip'] = assigned_ip
+
+        update_current_wg_config()
+
+        flash(f"Peer {peer.public_key} regenerated successfully! New configuration shown below.", "success")
+        return redirect(url_for('dashboard'))
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error regenerating peer {peer_id}: {e}", exc_info=True)
+        flash(f"Error regenerating peer: {e}", "danger")
+        return redirect(url_for('dashboard'))
+
+@app.route('/delete_peer/<int:peer_id>', methods=['POST'])
+@flask_login_required
+def delete_peer(peer_id):
+    user = current_user
+    if not user:
+        flash("User not logged in.", "danger")
+        return redirect(url_for('login'))
+
+    peer_to_delete = WireGuardPeer.query.filter_by(id=peer_id, user_id=user.id).first()
+    if not peer_to_delete:
+        flash("Peer not found or you do not have permission to delete it.", "warning")
+        return redirect(url_for('dashboard'))
+
+    try:
+        db.session.delete(peer_to_delete)
+        db.session.commit()
+
+        update_current_wg_config()
+
+        flash("WireGuard peer deleted successfully.", "success")
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error deleting peer {peer_id} for user {user.id}: {e}", exc_info=True)
+        flash(f"Error deleting peer: {e}", "danger")
+
+    return redirect(url_for('dashboard'))
+
+@app.route('/download_specific_config/<int:peer_id>')
+@flask_login_required
+def download_specific_config(peer_id):
+    user = current_user
+    if not user:
+        flash("User not logged in.", "danger")
+        return redirect(url_for('login'))
+
+    peer = WireGuardPeer.query.filter_by(id=peer_id, user_id=user.id).first()
+    if not peer:
+        flash("Peer not found or you do not have permission to download its config.", "danger")
+        return redirect(url_for('dashboard'))
+
+    flash("Config download for existing peers is not available without regenerating the key pair for security. Please use 'Regenerate Peer' if you need a new configuration file.", "danger")
+    return redirect(url_for('dashboard'))
+
+def update_current_wg_config():
+    try:
+        all_enabled_peers = WireGuardPeer.query.filter(WireGuardPeer.enabled == True).all()
         peer_data_for_wg = [{
             'public_key': p.public_key,
             'assigned_ip': p.assigned_ip,
             'keycloak_username': p.keycloak_username,
-            'enabled': p.enabled
+            'enabled': p.enabled,
+            'allowed_ips': p.allowed_ips
         } for p in all_enabled_peers]
 
-
-        update_wireguard_server_config_temp(
+        server_config_content = generate_server_config_string(
             peer_data_for_wg,
-            app.config['WG_CONFIG_PATH'],
-            os.getenv('WG_SERVER_PRIVATE_KEY'),
-            app.config['WG_INTERNAL_NETWORK'].split('/')[0] + '.1',
-            51820,
-            os.getenv('WG_PUBLIC_INTERFACE', 'eth0')
+            app.config['WG_SERVER_PRIVATE_KEY'],
+            app.config['WG_SERVER_ADDRESS_CIDR'],
+            app.config['WG_SERVER_LISTEN_PORT'],
+            app.config['WG_PUBLIC_INTERFACE']
         )
-        # Trigger the sync script on the server for the updated config
-        try:
-            subprocess.run(f"sudo /usr/local/bin/sync_wireguard.sh", check=True, shell=True)
-            app.logger.info("WireGuard config update triggered successfully (delete).")
-        except subprocess.CalledProcessError as e:
-            app.logger.error(f"Error triggering WireGuard sync during delete: {e}", exc_info=True)
-            flash(f"Error: Could not apply WireGuard configuration on server after delete. Please contact support.", "danger")
-            # This is tricky: if DB deleted but WG not, manual intervention is needed.
-            # For simplicity here, we proceed, but in real enterprise, you might queue for retry.
-        flash("WireGuard peer deleted successfully.", "success")
+
+        wrapper_script_path = '/usr/local/bin/update_wg_config.sh'
+
+        command = ['sudo', wrapper_script_path, server_config_content]
+
+        app.logger.info(f"Attempting to run privileged WireGuard config update: {' '.join(command[:2])} ...")
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+
+        app.logger.info(f"WireGuard config update script stdout: {result.stdout}")
+        if result.stderr:
+            app.logger.warning(f"WireGuard config update script stderr: {result.stderr}")
+
+        flash("WireGuard server configuration updated and applied successfully!", "success")
+        return True
+    except subprocess.CalledProcessError as e:
+        app.logger.error(f"Error triggering WireGuard sync: Script failed. Command: {' '.join(e.cmd)}, Return Code: {e.returncode}, Stdout: {e.stdout}, Stderr: {e.stderr}")
+        flash(f"Error: Could not apply WireGuard configuration on server. Details: {e.stderr.strip()}", "danger")
+        return False
     except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error deleting peer: {e}", exc_info=True)
-        flash(f"Error deleting peer: {e}", "danger")
-    return redirect(url_for('dashboard'))
+        app.logger.error(f"Error updating WireGuard server config: {e}", exc_info=True)
+        flash(f"Error: Server configuration update failed. Please contact support.", "danger")
+        return False
 
-@app.route('/download_config')
-@login_required
-def download_config():
-    user_id = session.get('user_id') # Use .get() for safety
-    peer = WireGuardPeer.query.filter_by(keycloak_user_id=user_id).first()
-
-    if not peer:
-        flash("No WireGuard configuration found.", "warning")
-        return redirect(url_for('dashboard'))
-
-    # If the private key is NOT stored, this route needs to change.
-    # It cannot generate the config if it doesn't have the private key.
-    # The user would have to *input* their private key to get the config,
-    # or you'd rely solely on the initial download after creation.
-    # Assuming for this corrected code that `temp_private_key` would be passed
-    # from a new key regeneration function, or if user is prompted to input.
-    # For now, this assumes peer.private_key exists, but it was removed from model.
-    # This function will only work if the private key is held temporarily in session
-    # after generation or regeneration.
-
-    # This part needs to be revisited if you strictly do not store private_key.
-    # For a client to download its config, it MUST have its private key.
-    # If the private key is NOT stored in the DB, then:
-    # 1. The initial config download happens immediately after peer creation (using temp_private_key in session).
-    # 2. For subsequent downloads, the user MUST be prompted to provide their *own* private key
-    #    (which they saved from the initial download) to generate the config for them.
-    # This current `download_config` implementation assumes peer.private_key is available,
-    # which contradicts the earlier removal from the model.
-
-    # Let's adjust this. If `temp_private_key` is available, use that.
-    # Otherwise, it implies the user needs to regenerate or manually provide their key.
-    client_private_key = session.get('temp_private_key') # Try to get from session
-    if not client_private_key:
-        flash("Private key not available for download. Please regenerate your peer or contact support if you lost your key.", "danger")
-        return redirect(url_for('dashboard'))
-
-    client_config = generate_client_config(
-        app.config['WG_SERVER_PUBLIC_KEY'],
-        app.config['WG_SERVER_ENDPOINT'],
-        client_private_key, # Use the private key from session
-        peer.assigned_ip,
-        app.config['WG_DNS_SERVERS'],
-        app.config['WG_ALLOWED_IPS']
-    )
-    
-    # Clear the temp_private_key from session after download
-    session.pop('temp_private_key', None)
-    session.pop('temp_peer_ip', None)
-
-    # Return as a file download
-    response = send_file(
-        BytesIO(client_config.encode('utf-8')),
-        mimetype='application/x-wireguard-conf',
-        as_attachment=True,
-        download_name=f"{peer.keycloak_username}.conf"
-    )
-    return response
-
-# --- Admin Routes (Example) ---
+# --- Admin Routes ---
 @app.route('/admin')
 @admin_required
 def admin_dashboard():
-    all_peers = WireGuardPeer.query.all()
-    return render_template('admin.html', peers=all_peers)
+    # Fetch all users
+    all_users = User.query.options(db.joinedload(User.wireguard_peers_collection)).all()
+
+    # --- MODIFICATION START HERE ---
+    # Sort users: Admins first, then alphabetically by username
+    def sort_key(user):
+        # Admins will have a lower (higher priority) value for sorting
+        # Non-admins will have a higher value
+        is_admin_priority = 0 if 'admin' in user.get_roles() else 1
+        return (is_admin_priority, user.username.lower()) # Sort by priority, then by lowercase username
+
+    all_users.sort(key=sort_key)
+    # --- MODIFICATION END HERE ---
+
+    return render_template('admin.html', all_users=all_users)
 
 @app.route('/admin/toggle_peer/<int:peer_id>', methods=['POST'])
 @admin_required
 def admin_toggle_peer(peer_id):
-    peer = WireGuardPeer.query.get_or_404(peer_id)
-    peer.enabled = not peer.enabled
-    try:
-        db.session.commit()
-        # Re-apply WireGuard config after change
-        all_enabled_peers = WireGuardPeer.query.filter_by(enabled=True).all()
-        peer_data_for_wg = [{
-            'public_key': p.public_key,
-            'assigned_ip': p.assigned_ip,
-            'keycloak_username': p.keycloak_username,
-            'enabled': p.enabled
-        } for p in all_enabled_peers]
+    peer = WireGuardPeer.query.filter_by(id=peer_id).first()
+    if not peer:
+        flash("Peer not found.", "danger")
+        return redirect(url_for('admin_dashboard'))
 
-        update_wireguard_server_config_temp(
-            peer_data_for_wg,
-            app.config['WG_CONFIG_PATH'],
-            os.getenv('WG_SERVER_PRIVATE_KEY'),
-            app.config['WG_INTERNAL_NETWORK'].split('/')[0] + '.1',
-            51820,
-            os.getenv('WG_PUBLIC_INTERFACE', 'eth0')
-        )
-        # Trigger the sync script on the server for the updated config
-        try:
-            subprocess.run(f"sudo /usr/local/bin/sync_wireguard.sh", check=True, shell=True)
-            app.logger.info(f"WireGuard config update triggered successfully (toggle for {peer.keycloak_username}).")
-        except subprocess.CalledProcessError as e:
-            app.logger.error(f"Error triggering WireGuard sync during toggle: {e}", exc_info=True)
-            flash(f"Error: Could not apply WireGuard configuration on server after toggle. Please contact support.", "danger")
-            # Consider if rollback is needed here
-        flash(f"Peer {peer.keycloak_username} {'enabled' if peer.enabled else 'disabled'}.", "success")
-    except Exception as e:
+    peer.enabled = not peer.enabled
+    db.session.commit()
+
+    if update_current_wg_config():
+        flash(f"Peer {peer.keycloak_username} (ID: {peer.id}) {'enabled' if peer.enabled else 'disabled'}.", "success")
+    else:
         db.session.rollback()
-        app.logger.error(f"Error toggling peer: {e}", exc_info=True)
-        flash(f"Error toggling peer: {e}", "danger")
+
     return redirect(url_for('admin_dashboard'))
 
-# --- Database Initialization (for development) ---
-#@app.before_first_request
-#def create_tables():
-#    db.create_all()
+@app.route('/admin/create_peer_for_user/<string:user_id>', methods=['POST'])
+@admin_required
+def admin_create_peer_for_user(user_id):
+    target_user = User.query.get(user_id)
+    if not target_user:
+        flash("Target user not found.", "danger")
+        return redirect(url_for('admin_dashboard'))
+
+    try:
+        private_key, public_key = generate_wireguard_keys()
+
+        all_enabled_peers = WireGuardPeer.query.filter(WireGuardPeer.enabled == True).all()
+        existing_ips = [p.assigned_ip for p in all_enabled_peers if p.assigned_ip]
+
+        assigned_ip = get_next_available_ip(app.config['WG_INTERNAL_NETWORK'], existing_ips)
+        if not assigned_ip:
+            raise ValueError("Could not assign an IP address. Network might be full.")
+
+        new_peer = WireGuardPeer(
+            user_id=target_user.id,
+            keycloak_user_id=target_user.id,
+            keycloak_username=target_user.username,
+            public_key=public_key,
+            assigned_ip=assigned_ip,
+            enabled=True,
+            created_at=datetime.utcnow(),
+            allowed_ips=app.config['WG_ALLOWED_IPS']
+        )
+        db.session.add(new_peer)
+        db.session.commit()
+
+        update_current_wg_config()
+        flash(f"New WireGuard peer created for {target_user.username}. Private key (for admin's reference only): {private_key}", "success")
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error creating peer for user {target_user.username}: {e}", exc_info=True)
+        flash(f"Error creating peer for {target_user.username}: {e}", "danger")
+
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/regenerate_peer/<int:peer_id>', methods=['POST'])
+@admin_required
+def admin_regenerate_peer(peer_id):
+    peer = WireGuardPeer.query.filter_by(id=peer_id).first()
+    if not peer:
+        flash("Peer not found.", "danger")
+        return redirect(url_for('admin_dashboard'))
+
+    try:
+        private_key, public_key = generate_wireguard_keys()
+
+        all_enabled_peers_except_current = WireGuardPeer.query.filter(
+            WireGuardPeer.enabled == True, WireGuardPeer.id != peer_id
+        ).all()
+        existing_ips = [p.assigned_ip for p in all_enabled_peers_except_current if p.assigned_ip]
+
+        assigned_ip = get_next_available_ip(app.config['WG_INTERNAL_NETWORK'], existing_ips)
+        if not assigned_ip:
+            raise ValueError("Could not assign a new IP address. Network might be full.")
+
+        peer.public_key = public_key
+        peer.assigned_ip = assigned_ip
+        peer.last_connected_at = None
+        db.session.commit()
+
+        update_current_wg_config()
+        flash(f"Peer for {peer.keycloak_username} (ID: {peer.id}) regenerated. New Private Key (for admin's reference only): {private_key}", "info")
+        flash(f"Peer {peer.keycloak_username} regenerated successfully!", "success")
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error regenerating peer {peer_id} by admin: {e}", exc_info=True)
+        flash(f"Error regenerating peer: {e}", "danger")
+
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/delete_peer/<int:peer_id>', methods=['POST'])
+@admin_required
+def admin_delete_peer(peer_id):
+    peer_to_delete = WireGuardPeer.query.filter_by(id=peer_id).first()
+    if not peer_to_delete:
+        flash("Peer not found.", "warning")
+        return redirect(url_for('admin_dashboard'))
+
+    try:
+        db.session.delete(peer_to_delete)
+        db.session.commit()
+
+        update_current_wg_config()
+        flash(f"WireGuard peer for {peer_to_delete.keycloak_username} deleted successfully.", "success")
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error deleting peer {peer_id} by admin: {e}", exc_info=True)
+        flash(f"Error deleting peer: {e}", "danger")
+
+    return redirect(url_for('admin_dashboard'))
 
 if __name__ == '__main__':
-    # Set environment variables for sensitive info in production
-    # For development, you can set them here for testing:
-    # os.environ['SECRET_KEY'] = 'your-flask-secret'
-    # os.environ['KEYCLOAK_CLIENT_SECRET'] = 'your-keycloak-client-secret'
-    # os.environ['WG_SERVER_PUBLIC_KEY'] = 'your-wg-server-public-key'
-    # os.environ['WG_SERVER_PRIVATE_KEY'] = 'your-wg-server-private-key'
-    # os.environ['WG_PUBLIC_INTERFACE'] = 'eth0' # or whatever your public interface is
-    app.run(debug=True, ssl_context='adhoc') # For HTTPS during development (not for production)
+    #with app.app_context():
+    #    db.create_all()
+    app.run(debug=True, host='0.0.0.0', port=5000)

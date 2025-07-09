@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}WireGuard Application{% endblock %}</title> {# Dynamic title #}
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        body {
+            padding-top: 20px;
+        }
+        .container {
+            max-width: 800px;
+        }
+        pre {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            white-space: pre-wrap; /* Ensure wrapping for long lines */
+            word-wrap: break-word;
+        }
+        .qr-code-img {
+            max-width: 250px;
+            height: auto;
+            display: block;
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            padding: 5px;
+            background-color: #fff;
+        }
+        .peer-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        /* New custom class for uniform width buttons if not using btn-block everywhere */
+        .uniform-button-width {
+            min-width: 150px; /* Adjust as needed */
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {# Flash messages block - usually placed at the top of content #}
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flashes">
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        {# Main content block where specific page content will go #}
+        {% block content %}{% endblock %}
+
+        <hr class="mt-5">
+        {# MODIFICATION START HERE - for uniform bottom navigation buttons #}
+        <div class="row align-items-center mb-4"> {# Use row for layout, align-items-center for vertical alignment #}
+            <div class="col-md-6 mb-2 mb-md-0 d-flex justify-content-start flex-wrap"> {# Left side for nav buttons #}
+                {% if not current_user.is_authenticated %}
+                    <a href="{{ url_for('index') }}" class="btn btn-info mr-2 mt-2">Home</a>
+                {% endif %}
+                {% if current_user.is_authenticated %}
+                    <a href="{{ url_for('dashboard') }}" class="btn btn-info mr-2 mt-2">Dashboard</a>
+                    {% if is_admin_status %}
+                        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-dark mr-2 mt-2">Admin Panel</a>
+                    {% endif %}
+                {% endif %}
+            </div>
+            <div class="col-md-6 d-flex justify-content-end"> {# Right side for Login/Logout #}
+                {% if current_user.is_authenticated %}
+                    <a href="{{ url_for('logout') }}" class="btn btn-secondary mt-2">Logout</a>
+                {% else %}
+                    <a href="{{ url_for('login') }}" class="btn btn-primary mt-2">Login</a>
+                {% endif %}
+            </div>
+        </div>
+        {# MODIFICATION END HERE #}
+    </div>
+
+    {# Common JavaScript files #}
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.4/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+
+    {# Specific page JavaScript block #}
+    {% block scripts %}{% endblock %}
+</body>
+</html>

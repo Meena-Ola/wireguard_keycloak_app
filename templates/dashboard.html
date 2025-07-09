@@ -1,71 +1,105 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WireGuard Dashboard</title>
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-    <style>
-        body { padding-top: 50px; }
-        .container { max-width: 1000px; }
-        .peer-box {
-            border: 1px solid #ddd;
-            padding: 15px;
-            margin-bottom: 15px;
-            border-radius: 5px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                <div class="alert alert-{{ category }}">{{ message }}</div>
-                {% endfor %}
+{% extends "base.html" %}
+
+{% block title %}WireGuard Dashboard{% endblock %}
+
+{% block content %}
+    <h1 class="mb-4">WireGuard Dashboard</h1>
+
+    {# Flash messages are now handled in base.html, so you can remove this block if you like #}
+    {# But if you want flash messages ONLY on the dashboard, keep it here and remove from base.html #}
+    {# For now, I'll assume you want them in base.html for all pages #}
+
+    {% if user %}
+        <p>Hello, <strong>{{ user.username }}</strong>!</p>
+        <p>Your ID: {{ user.id }}</p>
+        <p>Your Email: {{ user.email }}</p>
+        <hr>
+    {% else %}
+        <p>Hello, Guest!</p>
+        <hr>
+    {% endif %}
+
+    {# --- START: One-Time Display of Newly Generated/Regenerated Peer Config --- #}
+    {% if generated_private_key %}
+        <div class="alert alert-success" role="alert">
+            <h2 class="alert-heading">Your New/Regenerated WireGuard Peer!</h2>
+            <p>Please save the following configuration **immediately**! This private key will not be shown again.</p>
+            <hr>
+            <h3 class="mt-4">Private Key:</h3>
+            <textarea rows="4" cols="50" class="form-control" readonly>{{ generated_private_key }}</textarea>
+            <p class="mt-2">Your Public Key: <strong>{{ generated_public_key }}</strong></p>
+            <p>Assigned IP: <strong>{{ generated_assigned_ip }}</strong></p>
+
+            {% if generated_client_config %}
+                <h3 class="mt-4">Client Configuration (.conf file)</h3>
+                <pre><code class="language-ini">{{ generated_client_config }}</code></pre>
+
+                {% if generated_qr_code_b64 %}
+                    <h3 class="mt-4">QR Code for Mobile</h3>
+                    <img src="data:image/png;base64,{{ generated_qr_code_b64 }}" alt="QR Code" class="qr-code-img">
+                {% endif %}
+
+                <div class="mt-4">
+                    <button type="button" class="btn btn-info" onclick="copyConfig()">Copy Configuration</button>
+                </div>
+            {% else %}
+                <p class="text-danger">Failed to generate client configuration. Please try again.</p>
             {% endif %}
-        {% endwith %}
+        </div>
+        <hr class="mb-5">
+    {% endif %}
 
-        <h1 class="mb-4">WireGuard Dashboard</h1>
-        <p>Hello, <strong>{{ user.username }}</strong>!
-            {% if is_admin %}<span class="badge badge-warning">Admin</span>{% endif %}
-        </p>
+    <h2 class="mb-3">Your Existing WireGuard Peers</h2>
+    {% if all_user_peers %}
+        <p>You have {{ all_user_peers|length }} configured peer(s).</p>
+        <div class="list-group">
+            {% for peer_item in all_user_peers %}
+                <div class="peer-card mb-3">
+                    <h5>Peer ID: {{ peer_item.id }} ({{ loop.index }})</h5>
+                    <p><strong>Public Key:</strong> <code>{{ peer_item.public_key }}</code></p>
+                    <p><strong>Assigned IP:</strong> <code>{{ peer_item.assigned_ip }}</code></p>
+                    <p><strong>Status:</strong> <span class="badge badge-{{ 'success' if peer_item.enabled else 'danger' }}">{{ 'Enabled' if peer_item.enabled else 'Disabled' }}</span></p>
+                    <p><strong>Created At:</strong> {{ peer_item.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</p>
 
-        {% if is_admin %}
-            <a href="{{ url_for('add_peer') }}" class="btn btn-primary mb-3">Add New Peer</a>
-        {% endif %}
-
-        <h2 class="mt-4">Your Peers:</h2>
-        {% if peers %}
-            <div class="row">
-            {% for peer in peers %}
-                <div class="col-md-6">
-                    <div class="peer-box {% if not peer.is_active %}bg-light text-muted{% endif %}">
-                        <h5>{{ peer.name }} {% if not peer.is_active %}<span class="badge badge-danger">Inactive</span>{% endif %}</h5>
-                        <p><strong>IP:</strong> {{ peer.assigned_ip }}</p>
-                        <p><strong>Public Key:</strong> <code>{{ peer.public_key }}</code></p>
-                        <p><strong>Created:</strong> {{ peer.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
-                        {% if peer.is_active %}
-                            <a href="{{ url_for('download_config', peer_id=peer.id) }}" class="btn btn-sm btn-info">Download Config</a>
-                            <a href="{{ url_for('qrcode_image', peer_id=peer.id) }}" class="btn btn-sm btn-secondary" target="_blank">Show QR Code</a>
-                            {% if is_admin %}
-                                <form action="{{ url_for('revoke_peer', peer_id=peer.id) }}" method="post" style="display:inline;">
-                                    <button type="submit" class="btn btn-sm btn-warning" onclick="return confirm('Are you sure you want to revoke {{ peer.name }}?');">Revoke</button>
-                                </form>
-                            {% endif %}
-                        {% else %}
-                            <span class="text-danger">This peer is inactive.</span>
-                        {% endif %}
+                    <div class="mt-3 d-flex flex-wrap"> {# Use d-flex and flex-wrap for buttons #}
+                        <form action="{{ url_for('regenerate_peer', peer_id=peer_item.id) }}" method="POST" class="mr-2 mb-2"> {# mr-2 for right margin, mb-2 for bottom margin #}
+                            <button type="submit" class="btn btn-warning btn-sm">Regenerate Peer Config</button>
+                        </form>
+                        <form action="{{ url_for('delete_peer', peer_id=peer_item.id) }}" method="POST" class="mb-2"> {# mb-2 for bottom margin #}
+                            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Are you sure you want to delete this peer? This cannot be undone and will disable its connection.');">Delete Peer</button>
+                        </form>
                     </div>
                 </div>
             {% endfor %}
-            </div>
-        {% else %}
-            <p>No WireGuard peers found for you yet. {% if is_admin %}Go ahead and <a href="{{ url_for('add_peer') }}">add one</a>!{% endif %}</p>
-        {% endif %}
+        </div>
+    {% else %}
+        <p>You currently have no active WireGuard peers.</p>
+    {% endif %}
 
-        <hr>
-        <p><a href="{{ url_for('index') }}" class="btn btn-link">Back to Home</a> | <a href="{{ url_for('logout') }}" class="btn btn-danger">Logout</a></p>
-    </div>
-</body>
-</html>
+    <h3 class="mt-5">Create a New Peer</h3>
+    <p>Click the button below to generate a brand new WireGuard peer configuration.</p>
+    {# MODIFICATION START HERE - for the "Create New Peer" button #}
+    <form action="{{ url_for('create_peer') }}" method="POST">
+        <button type="submit" class="btn btn-primary btn-block">Create New Peer</button>
+    </form>
+    {# MODIFICATION END HERE #}
+
+    {% if is_admin %}
+        <h3 class="mt-5">Admin Actions</h3>
+        <p>As an admin, you can manage all peers <a href="{{ url_for('admin_dashboard') }}">here</a>.</p>
+    {% endif %}
+
+    {# Removed standard Back to Home / Logout as they are now (potentially) in base.html #}
+{% endblock %}
+
+{% block scripts %}
+    {# Dashboard-specific JavaScript here #}
+    <script>
+        function copyConfig() {
+            var textarea = document.querySelector('textarea');
+            textarea.select();
+            document.execCommand('copy');
+            alert('Configuration copied to clipboard!');
+        }
+    </script>
+{% endblock %}

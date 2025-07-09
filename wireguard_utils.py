@@ -4,7 +4,7 @@ import qrcode
 from io import BytesIO
 import base64
 import os
-import wgconfig # pip install wgconfig
+# import wgconfig # We don't need wgconfig in here anymore for writing files, only generating strings
 
 def generate_wireguard_keys():
     private_key = subprocess.check_output("wg genkey", shell=True).decode("utf-8").strip()
@@ -15,10 +15,21 @@ def get_next_available_ip(network_cidr, existing_ips):
     """Finds the next available IP address in the given CIDR, excluding existing IPs."""
     network = ipaddress.ip_network(network_cidr)
     # Start from .2 if server is .1, adjust if server is different
-    start_ip = network.network_address + 2
-    for ip_int in range(int(start_ip), int(network.broadcast_address)):
-        ip = ipaddress.ip_address(ip_int)
-        if str(ip) not in existing_ips:
+    # This assumes the server IP is .1 within the CIDR range
+    server_ip_str = str(network.network_address + 1)
+
+    # Ensure existing_ips includes the server IP if it's within the allocatable range
+    if server_ip_str not in existing_ips:
+        existing_ips_set = set(existing_ips)
+        existing_ips_set.add(server_ip_str)
+    else:
+        existing_ips_set = set(existing_ips)
+
+    # Start looking for IPs from .2 onwards within the subnet
+    # Assuming .1 is reserved for the server
+    for i in range(2, network.num_addresses - 1): # Exclude network address (.0) and broadcast address
+        ip = network.network_address + i
+        if str(ip) not in existing_ips_set:
             return str(ip)
     raise ValueError("No available IP addresses in the subnet.")
 
@@ -37,87 +48,43 @@ PersistentKeepalive = 25
 """
     return config
 
-def update_wireguard_server_config(peer_data_list, wg_config_path, server_private_key, server_address, listen_port, public_interface):
+def generate_server_config_string(peer_data_list, server_private_key, server_address_cidr, listen_port, public_interface):
     """
-    Updates the /etc/wireguard/wg0.conf file with current peers.
-    Requires root/sudo privileges for the web app to write to this file.
-    **CRITICAL SECURITY NOTE**: Ensure your web app runs with minimal privileges and
-    this function is carefully protected.
-    A safer alternative is for the web app to write to a temporary file,
-    and a separate, more restricted service (e.g., a systemd unit or cron job)
-    owned by root then applies the config changes using `wg syncconf`.
+    Generates the complete WireGuard server wg0.conf content as a string.
+    This function no longer writes to file or interacts with subprocess.
     """
-    wc = wgconfig.WGConfig(wg_config_path)
-    wc.initialize_file() # Clears existing config and adds interface header
+    server_ip = server_address_cidr.split('/')[0] # Get just the IP part
 
-    # Add server interface details
-    wc.add_attr(None, 'Address', server_address)
-    wc.add_attr(None, 'ListenPort', str(listen_port))
-    wc.add_attr(None, 'PrivateKey', server_private_key)
-    wc.add_attr(None, 'PostUp', f"iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {public_interface} -j MASQUERADE")
-    wc.add_attr(None, 'PostDown', f"iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {public_interface} -j MASQUERADE")
+    config_lines = []
 
-    # Add peers
+    # [Interface] section
+    config_lines.append("[Interface]")
+    config_lines.append(f"PrivateKey = {server_private_key}")
+    config_lines.append(f"Address = {server_address_cidr}") # Use the full CIDR for the server
+    config_lines.append(f"ListenPort = {str(listen_port)}")
+    # Use your actual public interface name from app.config
+    config_lines.append(f"PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {public_interface} -j MASQUERADE")
+    config_lines.append(f"PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {public_interface} -j MASQUERADE")
+    config_lines.append("\n") # Add a newline for separation
+
+    # [Peer] sections
     for peer in peer_data_list:
-        if peer['enabled']:
-            wc.add_peer(peer['public_key'], f"# {peer['keycloak_username']}")
-            wc.add_attr(peer['public_key'], 'AllowedIPs', f"{peer['assigned_ip']}/32")
-            # You could add PresharedKey if you use them:
-            # wc.add_attr(peer['public_key'], 'PresharedKey', peer['preshared_key'])
+        # Only include enabled peers in the server config
+        if peer.get('enabled', False): # Use .get with default False for safety
+            config_lines.append("[Peer]")
+            config_lines.append(f"PublicKey = {peer['public_key']}")
+            # Add a comment for easier identification
+            config_lines.append(f"# Client: {peer.get('keycloak_username', 'Unknown')}")
+            config_lines.append(f"AllowedIPs = {peer['assigned_ip']}/32")
+            # If you were storing PresharedKey in DB, you'd add it here:
+            # if 'preshared_key' in peer and peer['preshared_key']:
+            #     config_lines.append(f"PresharedKey = {peer['preshared_key']}")
+            config_lines.append("\n") # Add a newline for separation
 
-    wc.write_file() # Writes to the config file
-
-    # Apply the new configuration
-    try:
-        subprocess.run(f"sudo wg syncconf {os.getenv('WG_INTERFACE_NAME', 'wg0')} {wg_config_path}", check=True, shell=True)
-        print("WireGuard configuration updated and applied.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error applying WireGuard config: {e}")
-        # Log the error, notify admin
-        raise
+    return "\n".join(config_lines)
 
 def generate_qr_code(config_content):
     img = qrcode.make(config_content)
     buffered = BytesIO()
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-def update_wireguard_server_config_temp(peer_data_list, wg_config_path, server_private_key, server_address, listen_port, public_interface):
-    """
-    Updates the /etc/wireguard/wg0.conf file with current peers.
-    Requires root/sudo privileges for the web app to write to this file.
-    **CRITICAL SECURITY NOTE**: Ensure your web app runs with minimal privileges and
-    this function is carefully protected.
-    A safer alternative is for the web app to write to a temporary file,
-    and a separate, more restricted service (e.g., a systemd unit or cron job)
-    owned by root then applies the config changes using `wg syncconf`.
-    """
-    wc = wgconfig.WGConfig(wg_config_path)
-    wc.initialize_file() # Clears existing config and adds interface header
-
-    # Add server interface details
-    wc.add_attr(None, 'Address', server_address)
-    wc.add_attr(None, 'ListenPort', str(listen_port))
-    wc.add_attr(None, 'PrivateKey', server_private_key)
-    wc.add_attr(None, 'PostUp', f"iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {public_interface} -j MASQUERADE")
-    wc.add_attr(None, 'PostDown', f"iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {public_interface} -j MASQUERADE")
-
-    # Add peers
-    for peer in peer_data_list:
-        if peer['enabled']:
-            wc.add_peer(peer['public_key'], f"# {peer['keycloak_username']}")
-            wc.add_attr(peer['public_key'], 'AllowedIPs', f"{peer['assigned_ip']}/32")
-            # You could add PresharedKey if you use them:
-            # wc.add_attr(peer['public_key'], 'PresharedKey', peer['preshared_key'])
-
-    wc.write_file() # Writes to the config file
-    print(f"WireGuard config written to temporary file: {"/etc/wireguard/temp.conf"}")
-
-    # Apply the new configuration
-    try:
-        subprocess.run(f"sudo wg syncconf {os.getenv('WG_INTERFACE_NAME', 'wg0')} {wg_config_path}", check=True, shell=True)
-        print("WireGuard configuration updated and applied.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error applying WireGuard config: {e}")
-        # Log the error, notify admin
-        raise
