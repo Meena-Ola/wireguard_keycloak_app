@@ -14,7 +14,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 from io import BytesIO
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
+from flask_apscheduler import APScheduler # Add this import
 
 # --- SQLAlchemy and Flask-Migrate Imports ---
 from flask_sqlalchemy import SQLAlchemy
@@ -35,7 +36,8 @@ from wireguard_utils import (
     get_next_available_ip,
     generate_client_config,
     generate_server_config_string,
-    generate_qr_code
+    generate_qr_code,
+    get_wireguard_peer_activity
 )
 
 # --- Logging Configuration ---
@@ -81,6 +83,27 @@ app.config['WG_PUBLIC_INTERFACE'] = os.getenv('WG_PUBLIC_INTERFACE', 'enp0s3')
 app.config['WG_SERVER_LISTEN_PORT'] = os.getenv('WG_SERVER_LISTEN_PORT', 51820)
 app.config['WG_SERVER_ADDRESS_CIDR'] = os.getenv('WG_SERVER_ADDRESS_CIDR', '10.8.0.1/24')
 
+# --- Add WG_PEER_INACTIVITY_THRESHOLD_DAYS to your app config ---
+app.config['WG_PEER_INACTIVITY_THRESHOLD_DAYS'] = os.getenv('WG_PEER_INACTIVITY_THRESHOLD_DAYS', 90)
+
+# --- Scheduler Configuration ---
+class SchedulerConfig:
+    SCHEDULER_API_ENABLED = False # Disable API for security if not needed
+    SCHEDULER_JOBSTORES = {
+        'default': {'type': 'sqlalchemy', 'url': app.config['SQLALCHEMY_DATABASE_URI']}
+    }
+    SCHEDULER_EXECUTORS = {
+        'default': {'type': 'threadpool', 'max_workers': 20}
+    }
+    SCHEDULER_JOB_DEFAULTS = {
+        'coalesce': False,
+        'max_instances': 1
+    }
+app.config.from_object(SchedulerConfig()) # Load scheduler config
+scheduler = APScheduler() # Initialize scheduler
+# --- End Scheduler Configuration ---
+
+
 # --- Database Initialization ---
 db.init_app(app)
 migrate = Migrate(app, db)
@@ -105,6 +128,7 @@ def load_user(user_id):
 
 # --- OIDC Client Initialization (using Authlib library) ---
 oauth = OAuth(app)
+# --- MOVE THIS REGISTRATION HERE ---
 try:
     keycloak_oauth = oauth.register(
         name='keycloak',
@@ -119,6 +143,61 @@ try:
     logger.info("Authlib Keycloak client registered successfully.")
 except Exception as e:
     logger.error(f"Error during Authlib Keycloak client registration: {e}", exc_info=True)
+# --- END MOVE ---
+
+# --- New functions for peer activity and inactivity check ---
+def update_peer_activity_status():
+    """
+    Periodically updates the last_connected_at for peers based on wg show dump.
+    """
+    with app.app_context(): # Ensure this runs within the Flask app context
+        logger.info("Starting scheduled job: Updating WireGuard peer activity status.")
+        peer_activity = get_wireguard_peer_activity()
+        updated_count = 0
+        for public_key, last_handshake_dt in peer_activity.items():
+            peer = WireGuardPeer.query.filter_by(public_key=public_key).first()
+            if peer and (peer.last_connected_at is None or peer.last_connected_at < last_handshake_dt):
+                peer.last_connected_at = last_handshake_dt
+                db.session.add(peer) # Add to session for update
+                updated_count += 1
+        db.session.commit()
+        logger.info(f"Finished scheduled job: Updated activity status for {updated_count} peers.")
+
+def disable_inactive_peers():
+    """
+    Disables WireGuard peers that have been inactive for a configured period.
+    """
+    with app.app_context(): # Ensure this runs within the Flask app context
+        logger.info("Starting scheduled job: Disabling inactive WireGuard peers.")
+        inactivity_threshold_days = app.config.get('WG_PEER_INACTIVITY_THRESHOLD_DAYS', 90) # Default 90 days
+        inactive_cutoff_date = datetime.utcnow() - timedelta(days=inactivity_threshold_days)
+
+        # Find enabled peers that haven't connected since the cutoff date
+        inactive_peers = WireGuardPeer.query.filter(
+            WireGuardPeer.enabled == True,
+            (WireGuardPeer.last_connected_at == None) | (WireGuardPeer.last_connected_at < inactive_cutoff_date)
+        ).all()
+
+        disabled_count = 0
+        for peer in inactive_peers:
+            peer.enabled = False
+            db.session.add(peer) # Add to session for update
+            disabled_count += 1
+            logger.info(f"Disabled inactive peer: {peer.keycloak_username} (ID: {peer.id}, Public Key: {peer.public_key})")
+
+        if disabled_count > 0:
+            db.session.commit()
+            if update_current_wg_config():
+                logger.info(f"Successfully disabled {disabled_count} inactive peers and updated WireGuard config.")
+                flash(f"Automatically disabled {disabled_count} inactive WireGuard peers.", "info")
+            else:
+                db.session.rollback()
+                logger.error(f"Failed to update WireGuard config after disabling {disabled_count} peers. Rolling back changes.")
+                flash("Error: Failed to update WireGuard config after disabling inactive peers.", "danger")
+        else:
+            logger.info("No inactive peers found to disable.")
+# --- END New functions ---
+
 
 # Helper function for admin check (now uses current_user directly)
 def is_admin_check():
@@ -129,7 +208,6 @@ def is_admin_check():
 # --- Context Processor to make current_user and is_admin_status available in all templates ---
 @app.context_processor
 def inject_user_and_roles():
-    # current_user is provided by Flask-Login
     return dict(current_user=current_user, is_admin_status=is_admin_check())
 
 # --- Custom Decorators (now using Flask-Login's login_required) ---
@@ -154,7 +232,7 @@ def index():
 def login():
     redirect_uri = url_for('oidc_callback', _external=True)
     logger.info(f"Initiating login redirect to Keycloak. Redirect URI: {redirect_uri}")
-    return keycloak_oauth.authorize_redirect(redirect_uri)
+    return keycloak_oauth.authorize_redirect(redirect_uri) # keycloak_oauth is now defined
 
 @app.route('/oidc/callback')
 def oidc_callback():
@@ -499,16 +577,12 @@ def admin_dashboard():
     # Fetch all users
     all_users = User.query.options(db.joinedload(User.wireguard_peers_collection)).all()
 
-    # --- MODIFICATION START HERE ---
     # Sort users: Admins first, then alphabetically by username
     def sort_key(user):
-        # Admins will have a lower (higher priority) value for sorting
-        # Non-admins will have a higher value
         is_admin_priority = 0 if 'admin' in user.get_roles() else 1
-        return (is_admin_priority, user.username.lower()) # Sort by priority, then by lowercase username
+        return (is_admin_priority, user.username.lower())
 
     all_users.sort(key=sort_key)
-    # --- MODIFICATION END HERE ---
 
     return render_template('admin.html', all_users=all_users)
 
@@ -631,5 +705,5 @@ def admin_delete_peer(peer_id):
 
 if __name__ == '__main__':
     #with app.app_context():
-    #    db.create_all()
+    #   db.create_all()
     app.run(debug=True, host='0.0.0.0', port=5000)

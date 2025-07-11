@@ -5,6 +5,8 @@ from io import BytesIO
 import base64
 import os
 # import wgconfig # We don't need wgconfig in here anymore for writing files, only generating strings
+import re # Import regex module
+from datetime import datetime, timedelta # Import datetime and timedelta
 
 def generate_wireguard_keys():
     private_key = subprocess.check_output("wg genkey", shell=True).decode("utf-8").strip()
@@ -88,3 +90,45 @@ def generate_qr_code(config_content):
     buffered = BytesIO()
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+def parse_wg_show_output(output):
+    """
+    Parses the output of 'wg show wg0 dump' to extract peer information.
+    Returns a dictionary mapping public_key to latest_handshake_timestamp.
+    """
+    peers_status = {}
+    # Regex to capture public key and latest handshake (seconds since epoch)
+    # This regex assumes 'wg show wg0 dump' format:
+    # public_key\tprivate_key\tendpoint_ip:port\tallowed_ips\tlatest_handshake\ttransfer_rx\ttransfer_tx\tpersistent_keepalive
+    # We are interested in public_key (group 1) and latest_handshake (group 5)
+    # The dump format is usually a single line per peer, tab-separated.
+    peer_line_pattern = re.compile(r'([a-zA-Z0-9+/=]{44})\t([a-zA-Z0-9+/=]{44})\t([0-9.]+:\d+)\t([0-9./,]+)\t(\d+)\t(\d+)\t(\d+)\t([0-9]+)?')
+
+    for line in output.splitlines():
+        match = peer_line_pattern.match(line.strip())
+        if match:
+            public_key = match.group(1)
+            latest_handshake_timestamp = int(match.group(5)) # Seconds since Unix epoch
+            peers_status[public_key] = datetime.fromtimestamp(latest_handshake_timestamp)
+    return peers_status
+
+def get_wireguard_peer_activity():
+    """
+    Executes 'sudo wg show wg0 dump' and parses its output to get peer activity.
+    Returns a dictionary mapping public_key to latest_handshake (datetime object).
+    """
+    try:
+        # Using 'wg show wg0 dump' is more machine-readable than 'wg show'
+        # Ensure your sudoers file allows the app user to run 'wg show wg0 dump' without password.
+        cmd = ['sudo', 'wg', 'show', 'wg0', 'dump']
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return parse_wg_show_output(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running 'wg show wg0 dump': {e.stderr}")
+        return {}
+    except FileNotFoundError:
+        print("Error: 'wg' command not found. Is WireGuard installed and in PATH?")
+        return {}
+    except Exception as e:
+        print(f"An unexpected error occurred while getting WireGuard peer activity: {e}")
+        return {}

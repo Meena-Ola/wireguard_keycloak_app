@@ -1,8 +1,10 @@
-Flask==2.3.3
+Flask==2.2.5
+Werkzeug==2.2.3
 Authlib==1.2.1
 Flask-SQLAlchemy==3.0.5
 Flask-Migrate==4.0.5
 Flask-Login==0.6.2
+Flask-APScheduler==1.12.4
 psycopg2-binary==2.9.9
 pyqrcode==1.2.1
 pypng==0.0.21
@@ -11,3 +13,5 @@ qrcode
 netaddr
 python-dotenv
 gunicorn
+requests
+Pillow
