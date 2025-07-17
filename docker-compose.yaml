@@ -1,0 +1,35 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    command: start-dev # For development, use start-prod for production with proper DB and HTTPS
+    environment:
+      KEYCLOAK_ADMIN: administrator
+      KEYCLOAK_ADMIN_PASSWORD: admin@123
+      KC_HOSTNAME: 192.168.56.101 # Set to your VM's IP or hostname in production
+      KC_HOSTNAME_STRICT_HTTPS: false # Set to true if using HTTPS
+      KC_HTTP_PORT: 3000 # Default HTTP port
+      KC_HTTPS_PORT: 8443 # Default HTTPS port
+      KC_FEATURES: scripts # Add this line
+      KC_PROXY: edge
+    ports:
+      - "3000:3000" # KeyCloak HTTP access
+      - "8443:8443" # KeyCloak HTTPS access (if configured later)
+    volumes:
+      - ./data:/opt/keycloak/data
+    networks:
+      - keycloak-net
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: test # CHANGE THIS!
+    volumes:
+      - ./db_data:/var/lib/postgresql/data
+    networks:
+      - keycloak-net
+
+networks:
+  keycloak-net:
+    driver: bridge
